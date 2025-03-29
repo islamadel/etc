@@ -1,0 +1,196 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>_metadata</key>
+	<dict>
+		<key>created_by</key>
+		<string>admin</string>
+		<key>creation_date</key>
+		<date>2023-11-27T10:05:42Z</date>
+		<key>munki_version</key>
+		<string>5.2.2.4286</string>
+		<key>os_version</key>
+		<string>10.13.6</string>
+	</dict>
+	<key>autoremove</key>
+	<false/>
+	<key>catalogs</key>
+	<array/>
+	<key>category</key>
+	<string>system</string>
+	<key>description</key>
+	<string>Removes old Mobile Accounts</string>
+	<key>developer</key>
+	<string>Islam Adel</string>
+	<key>display_name</key>
+	<string>Remove old Mobile Accounts</string>
+	<key>installcheck_script</key>
+	<string>#!/bin/bash
+# Islam Adel
+# remove old mobile accounts
+# 2023-08-22
+# 2023-08-23
+# 2023-08-29 delete old archived users
+# 2023-11-27 added sudo
+
+# remove user is older than n days
+last_login_days=60
+# ldap user group id
+domain_group_id=100
+# archive user profile: 1 to enable
+archive_user=1
+#remove archived users after n days
+remove_archive_days=365
+
+#exclude following hostname prefix from archive
+host_name_prefix="$(hostname | awk -F- '{print $1}')"
+if [ "${host_name_prefix}" == "rpp" ]; then archive_user=0; fi
+if [ "${host_name_prefix}" == "rpp" ]; then last_login_days=2; fi
+
+###################
+
+echo "Remove old Mobile Accounts. Older than ${last_login_days} days"
+
+#count number of users
+if [ "$(dscl . list /Users UniqueID | awk '$2 &gt; 1000 {print $1}' | wc -l | awk '{print $1}')" -le "1" ]; then
+	echo "Maximum 1 User found, exit now"
+	exit 1
+fi
+
+userList=$(dscl . list /Users UniqueID | awk '$2 &gt; 1000 {print $1}')
+for a in $userList ; do
+	echo "check for User: ${a}"
+	#user is not empty, belongs to domain group id and is not currently logged in
+	if [ "${a}" ] &amp;&amp; [[ "$(id -g "${a}")" == "${domain_group_id}" ]] &amp;&amp; ! /usr/bin/w | awk '{print $1}' | grep -wq "${a}"; then
+		echo "Mobile Account found : $(id -F "${a}") (${a})"
+		
+		if [ ! -d "/Users/${a}/Library/Preferences" ]; then
+				echo "/Users/${a}/Library/Preferences does not exist"
+				exit 1
+		fi
+		
+		# Filter by last login date
+		if ! find /Users/${a}/Library/Preferences -mtime -${last_login_days} | grep -wq "/Users/${a}"; then
+			echo "$(date '+%Y-%m-%d %H:%M:%S') : /Users/${a} : Last login is older than ${last_login_days} days, account will be deleted" | tee -a "/Users/Shared/removed_accounts.txt"
+
+			#re-check
+			last_mod=$(stat -f "%Sm" -t "%s" "/Users/${a}/Library/Preferences")
+			now=$(date +%s)
+			difference=$(($now-$last_mod))
+			age_days=$(($difference/(3600*24)))
+			echo "Account of ${a} is ${age_days} days old" | tee -a "/Users/Shared/removed_accounts.txt"
+			
+			if [ "${age_days}" -ge "${last_login_days}" ]; then
+				echo "$(date '+%Y-%m-%d %H:%M:%S') : Prepairung User ${a} removal .." | tee -a "/Users/Shared/removed_accounts.txt"
+
+				if [ "${archive_user}" != "0" ]; then
+					#check if enough disk space
+					free_space=$(df /Users/ | awk '{print $4}' | tail -1)
+					user_size=$(sudo du -s "/Users/${a}" | awk '{print $1}')
+					
+					if [ "${free_space}" -le "${user_size}" ]; then
+						echo "$(date '+%Y-%m-%d %H:%M:%S') : Not enough free space to proceed" | tee -a "/Users/Shared/removed_accounts.txt"
+						exit 1
+					fi
+					
+					#archive User
+					echo "$(date '+%Y-%m-%d %H:%M:%S') : archiving User: ${a} to /Users/Deleted Users/${a}.dmg" | tee -a "/Users/Shared/removed_accounts.txt"
+					mkdir -p "/Users/Deleted Users"
+					#fix rights
+					sudo chown -R "${a}" "/Users/${a}"
+					#rename existing dmg
+					if [ -f "/Users/Deleted Users/${a}.dmg" ]; then
+						sudo mv "/Users/Deleted Users/${a}.dmg" "/Users/Deleted Users/${a}_$(date '+%Y-%m-%d_%H-%M-%S').dmg"
+					fi
+					#create dmg
+					sudo hdiutil create -volname "${a}" -srcfolder "/Users/${a}" -ov -format UDZO "/Users/Deleted Users/${a}.dmg"
+					archive_exit_code=$?
+					if [ "${archive_exit_code}" == "0" ]; then
+							echo "$(date '+%Y-%m-%d %H:%M:%S') : archiving User ${a} success. Deleting User" | tee -a "/Users/Shared/removed_accounts.txt"
+							#delete User
+							sudo dscl . delete "/Users/${a}"
+							if [ "$?" == "0" ]; then
+								sudo rm -rf "/Users/${a}"
+							else
+								echo "$(date '+%Y-%m-%d %H:%M:%S') : deleting User: ${a} failed. Archive will be removed" | tee -a "/Users/Shared/removed_accounts.txt"
+								sudo rm -rf "/Users/Deleted Users/${a}.dmg"
+								exit 1
+							fi
+					else
+						echo "$(date '+%Y-%m-%d %H:%M:%S') : archiving User ${a} failed. Deletion aborted" | tee -a "/Users/Shared/removed_accounts.txt"
+					fi
+				else
+					echo "$(date '+%Y-%m-%d %H:%M:%S') : No User archive will be created for: ${a} success. Deleting User" | tee -a "/Users/Shared/removed_accounts.txt"
+					#delete User
+					sudo dscl . delete "/Users/${a}"
+					if [ "$?" == "0" ]; then
+						sudo rm -rf "/Users/${a}"
+					else
+						echo "$(date '+%Y-%m-%d %H:%M:%S') : deleting User: ${a} failed." | tee -a "/Users/Shared/removed_accounts.txt"
+						exit 1
+					fi
+				fi
+			else
+				echo "$(date '+%Y-%m-%d %H:%M:%S') : Second date check failed. User ${a} will not be removed" | tee -a "/Users/Shared/removed_accounts.txt"
+			fi
+		else
+			last_mod=$(stat -f "%Sm" -t "%s" /Users/${a}/Library/Preferences)
+			now=$(date +%s)
+			difference=$(($now-$last_mod))
+			age_days=$(($difference/(3600*24)))
+			echo "Account of ${a} is only ${age_days} days old"
+		fi
+	fi
+done
+
+#remove old archived users
+old_IFS=$IFS
+IFS="
+"
+if find "/Users/Deleted Users" -mtime +${remove_archive_days} -type f -iname "*.dmg" | grep -wq "/Users/Deleted Users"; then
+	# old archived users found
+	for old_archive in $(find "/Users/Deleted Users" -mtime +${remove_archive_days} -type f -iname "*.dmg"); do
+			echo "old User archive found, older than ${remove_archive_days} days: ${old_archive}"
+			
+			#re-check days
+			last_mod=$(stat -f "%Sm" -t "%s" "${old_archive}")
+			now=$(date +%s)
+			difference=$(($now-$last_mod))
+			age_days=$(($difference/(3600*24)))
+			
+			if [ "${age_days}" -ge "${remove_archive_days}" ]; then
+				echo "$(date '+%Y-%m-%d %H:%M:%S') : old User archive, age: ${age_days} days, will be deleted: ${old_archive}" | tee -a "/Users/Shared/removed_accounts.txt"
+				#remove archive
+				sudo rm -f "${old_archive}"
+			else
+				echo "archive: ${old_archive} is only: ${age_days} days old"
+			fi
+	done
+else
+	echo "No archived Users found, older than: ${remove_archive_days} days"
+	exit 1
+fi
+IFS=${old_IFS}
+exit 1</string>
+	<key>installer_type</key>
+	<string>nopkg</string>
+	<key>minimum_os_version</key>
+	<string>10.4.0</string>
+	<key>name</key>
+	<string>remove_old_mobile-accounts</string>
+	<key>notes</key>
+	<string>2023-08-29_12-03-41 By: Islam Adel</string>
+	<key>postinstall_script</key>
+	<string>#!/bin/bash
+exit 0</string>
+	<key>unattended_install</key>
+	<true/>
+	<key>unattended_uninstall</key>
+	<false/>
+	<key>uninstall_method</key>
+	<string>uninstall_script</string>
+	<key>version</key>
+	<string>2.2</string>
+</dict>
+</plist>
